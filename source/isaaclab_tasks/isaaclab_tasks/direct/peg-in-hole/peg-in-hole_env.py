@@ -18,16 +18,20 @@ from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
 from isaaclab.utils.math import sample_uniform
 
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-# from isaaclab.utils.math import quat_from_angle_axis
 
 from isaaclab.markers.config import FRAME_MARKER_CFG
 from isaaclab.utils.math import combine_frame_transforms, compute_pose_error, quat_from_euler_xyz, quat_unique
 
 
+import os
+import pickle
+
+TRAIN = True
+
 @configclass
 class UREnvCfg(DirectRLEnvCfg):
     # env
-    episode_length_s = 3 # 8.3333 s  = 500 timesteps
+    episode_length_s = 8.3333 #s  = 500 timesteps
     decimation = 2
     action_space = 9
     observation_space = 23 - 2 + 4
@@ -169,6 +173,23 @@ class UREnv(DirectRLEnv):
         self._resample_command(torch.arange(self.num_envs))
         self.goal_pose_visualizer.visualize(self.pose_command_w[:, :3], self.pose_command_w[:, 3:])
 
+        if TRAIN:
+            base_path = "logs/skrl/reach_franka"
+            self.folder_path = self.find_latest_folder(base_path) + '/checkpoints/mydata/'
+            
+            if not os.path.exists(self.folder_path):
+                os.makedirs(self.folder_path)
+
+            self.data = {
+                "env_interaction": [],
+                "rewards": [],
+                "dist_reward": [],
+                "rot_reward": [],
+                "action_penalty": [],
+            }
+            self.episode_counter = 0
+
+
     def _setup_scene(self):
         self._robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self._robot
@@ -216,6 +237,25 @@ class UREnv(DirectRLEnv):
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         terminated = torch.tensor([False], dtype=torch.bool)
         truncated = self.episode_length_buf >= self.max_episode_length - 1
+        if TRAIN:
+            if truncated.all():
+                if self.folder_path:
+                    file_path = os.path.join(self.folder_path, f"data_ep{self.episode_counter}.pkl")
+                    print("\n\n",file_path)
+                    if not os.path.exists(file_path): # never override data
+                        with open(file_path, "wb") as f:
+                            pickle.dump(self.data, f)
+                        print(f"Data saved to {file_path}")                    
+                    self.data = {
+                        "env_interaction": [],
+                        "rewards": [],
+                        "dist_reward": [],
+                        "rot_reward": [],
+                        "action_penalty": [],
+                    }
+                    self.episode_counter += 1
+                else:
+                    print("No valid folder found to save data.")
         return terminated, truncated
 
     def _get_rewards(self) -> torch.Tensor:
@@ -299,6 +339,9 @@ class UREnv(DirectRLEnv):
         dist_reward = torch.where(d <= 0.02, dist_reward * 2, dist_reward)
 
         dot = torch.sum(ur_rot * des_rot, dim=1)
+        # rot_reward = 1.0 / (1.0 + dot**2)
+        # rot_reward *= rot_reward
+        # rot_reward = torch.where(dot <= 0.02, rot_reward * 2, rot_reward)
         rot_reward = 0.5 * torch.sign(dot) * dot**2
 
         # regularization on the actions (summed for each environment)
@@ -309,11 +352,18 @@ class UREnv(DirectRLEnv):
             + rot_reward_scale * rot_reward
             - action_penalty_scale * action_penalty
         )
-        self.extras["log"] = {
-            "dist_reward": (dist_reward_scale * dist_reward).mean(),
-            "rot_reward": (rot_reward_scale * rot_reward).mean(),
-            "action_penalty": (-action_penalty_scale * action_penalty).mean(),
-        }
+        # self.extras["log"] = {
+        #     "dist_reward": (dist_reward_scale * dist_reward).mean(),
+        #     "rot_reward": (rot_reward_scale * rot_reward).mean(),
+        #     "action_penalty": (-action_penalty_scale * action_penalty).mean(),
+        # }
+        # print('\n\n here')
+        if TRAIN:
+            self.data["env_interaction"].append(self.episode_length_buf.cpu().tolist()[0])
+            self.data["rewards"].append(rewards.mean().cpu().tolist())
+            self.data["dist_reward"].append((dist_reward_scale * dist_reward).mean().cpu().tolist())
+            self.data["rot_reward"].append((rot_reward_scale * rot_reward).mean().cpu().tolist())
+            self.data["action_penalty"].append((-action_penalty_scale * action_penalty).mean().cpu().tolist())
         return rewards
 
     def _resample_command(self, env_ids):
@@ -340,6 +390,14 @@ class UREnv(DirectRLEnv):
             self.pose_command_b[:, :3],
             self.pose_command_b[:, 3:],
         )
+
+        
+
+    def find_latest_folder(self, base_path):
+        folders = [f for f in os.listdir(base_path) if os.path.isdir(os.path.join(base_path, f))]
+        latest_folder = sorted(folders)[-1] if folders else None
+        return os.path.join(base_path, latest_folder) if latest_folder else None
+
 
 # save in case it is useful
 
